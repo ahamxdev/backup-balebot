@@ -6,6 +6,17 @@ from pathlib import Path
 from typing import Iterable
 
 
+DEFAULT_CAPTION_TEMPLATE = (
+    "Backup uploaded\n"
+    "File: {filename}\n"
+    "Size: {size_human}\n"
+    "Server: {hostname}\n"
+    "Public IP: {public_ip}\n"
+    "Backup mtime: {file_modified_at}\n"
+    "Sent at: {sent_at}"
+)
+
+
 def _parse_bool(value: str, *, default: bool = False) -> bool:
     if value is None:
         return default
@@ -58,6 +69,10 @@ class Settings:
     long_poll_timeout_seconds: int
     retry_backoff_seconds: float
     caption_template: str
+    server_public_ip: str
+    public_ip_lookup_enabled: bool
+    public_ip_lookup_url: str
+    public_ip_lookup_timeout_seconds: float
     max_file_size_mb: int
     startup_send_existing: bool
     clear_webhook_on_start: bool
@@ -127,7 +142,14 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         request_timeout_seconds=_parse_float(os.getenv("REQUEST_TIMEOUT_SECONDS"), default=120.0),
         long_poll_timeout_seconds=_parse_int(os.getenv("LONG_POLL_TIMEOUT_SECONDS"), default=30),
         retry_backoff_seconds=_parse_float(os.getenv("RETRY_BACKOFF_SECONDS"), default=10.0),
-        caption_template=os.getenv("CAPTION_TEMPLATE", "Backup file: {filename}"),
+        caption_template=os.getenv("CAPTION_TEMPLATE", DEFAULT_CAPTION_TEMPLATE).replace("\\n", "\n"),
+        server_public_ip=os.getenv("SERVER_PUBLIC_IP", "").strip(),
+        public_ip_lookup_enabled=_parse_bool(os.getenv("PUBLIC_IP_LOOKUP_ENABLED"), default=True),
+        public_ip_lookup_url=os.getenv("PUBLIC_IP_LOOKUP_URL", "https://api.ipify.org").strip(),
+        public_ip_lookup_timeout_seconds=_parse_float(
+            os.getenv("PUBLIC_IP_LOOKUP_TIMEOUT_SECONDS"),
+            default=3.0,
+        ),
         max_file_size_mb=_parse_int(os.getenv("MAX_FILE_SIZE_MB"), default=50),
         startup_send_existing=_parse_bool(os.getenv("STARTUP_SEND_EXISTING"), default=True),
         clear_webhook_on_start=_parse_bool(os.getenv("CLEAR_WEBHOOK_ON_START"), default=True),

@@ -4,10 +4,14 @@ import fcntl
 import logging
 import os
 import signal
+import socket
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
+
+import requests
 
 from .bale_api import BaleAPIError, BaleClient
 from .config import Settings
@@ -101,6 +105,8 @@ class BackupSenderService:
         self._tracker = FileStabilityTracker(settings.stable_seconds)
         self._stop = False
         self._startup_ignored: set[Path] = set()
+        self._hostname = socket.gethostname()
+        self._public_ip_cache: str | None = settings.server_public_ip or None
 
     def install_signal_handlers(self) -> None:
         def _handler(signum, _frame) -> None:
@@ -243,7 +249,8 @@ class BackupSenderService:
         if not path.exists():
             return False
 
-        file_size = path.stat().st_size
+        file_stat = path.stat()
+        file_size = file_stat.st_size
         if file_size > self.settings.max_file_size_bytes:
             LOGGER.error(
                 "skipping file bigger than max size file=%s size=%s max=%s",
@@ -254,6 +261,11 @@ class BackupSenderService:
             self._tracker.mark_ready(path)
             return False
 
+        caption = self._build_caption(
+            path=path,
+            file_size=file_size,
+            file_mtime=file_stat.st_mtime,
+        )
         sending_path = path.with_name(path.name + UPLOADING_SUFFIX)
         try:
             path.rename(sending_path)
@@ -263,7 +275,6 @@ class BackupSenderService:
             LOGGER.exception("failed to claim file for upload: %s", path)
             return False
 
-        caption = self.settings.caption_template.format(filename=path.name)
         LOGGER.info("sending file=%s size=%s", path.name, file_size)
         try:
             result = self.client.send_document(
@@ -291,3 +302,53 @@ class BackupSenderService:
         self._tracker.mark_ready(path)
         self._startup_ignored.discard(path)
         return True
+
+    def _build_caption(self, path: Path, file_size: int, file_mtime: float) -> str:
+        return self.settings.caption_template.format(
+            filename=path.name,
+            file_size=file_size,
+            size_human=_format_bytes(file_size),
+            hostname=self._hostname,
+            public_ip=self._get_public_ip(),
+            backup_dir=str(self.settings.backup_dir),
+            file_modified_at=_format_timestamp(file_mtime),
+            sent_at=_format_timestamp(time.time()),
+        )
+
+    def _get_public_ip(self) -> str:
+        if self._public_ip_cache:
+            return self._public_ip_cache
+        if not self.settings.public_ip_lookup_enabled:
+            return "unknown"
+
+        try:
+            response = requests.get(
+                self.settings.public_ip_lookup_url,
+                timeout=self.settings.public_ip_lookup_timeout_seconds,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            LOGGER.warning("failed to resolve public IP: %s", exc)
+            return "unknown"
+
+        public_ip = response.text.strip()
+        if not public_ip:
+            return "unknown"
+
+        self._public_ip_cache = public_ip
+        return public_ip
+
+
+def _format_bytes(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.2f} {unit}"
+        value /= 1024
+    return f"{size} B"
+
+
+def _format_timestamp(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")

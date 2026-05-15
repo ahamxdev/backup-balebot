@@ -46,6 +46,33 @@ BALE_TARGET_CHAT_ID=
 - `BACKUP_FILE_PATTERNS=*.bak,*.backup,*.dump,*.gz,*.sql,*.sql.gz,*.tar,*.tar.gz,*.xz,*.zip,*.zst`
 - `STABLE_SECONDS=20`
 - `SCAN_INTERVAL_SECONDS=5`
+- `SERVER_PUBLIC_IP=` اگر خالی باشد، سرویس خودش IP پابلیک را lookup می‌کند.
+- `PUBLIC_IP_LOOKUP_URL=https://api.ipify.org`
+
+کپشن پیش‌فرض هر فایل کوتاه ولی کاربردی است:
+
+```text
+Backup uploaded
+File: db.sql.gz
+Size: 12.34 MB
+Server: my-server
+Public IP: 203.0.113.10
+Backup mtime: 2026-05-16 02:30:12 +0330
+Sent at: 2026-05-16 02:30:35 +0330
+```
+
+اگر خواستی متن کپشن را عوض کنی، `CAPTION_TEMPLATE` را در `.env` تغییر بده. placeholderهای قابل استفاده:
+
+```text
+{filename}
+{file_size}
+{size_human}
+{hostname}
+{public_ip}
+{backup_dir}
+{file_modified_at}
+{sent_at}
+```
 
 ## گرفتن `chat_id`
 

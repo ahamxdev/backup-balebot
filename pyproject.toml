@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "balebot-backup-sender"
+version = "1.0.0"
+description = "Production-ready Bale bot that sends new backup files from a directory and deletes them after successful upload"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "requests>=2.32.0",
+]
+
+[project.scripts]
+bale-backup-bot = "balebot_backup.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,25 @@
+[Unit]
+Description=Bale Backup Sender Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/backup-balebot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/backup-balebot/.venv/bin/bale-backup-bot --env-file /opt/backup-balebot/.env
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/backup /tmp /opt/backup-balebot
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,293 @@
+from __future__ import annotations
+
+import fcntl
+import logging
+import os
+import signal
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+from .bale_api import BaleAPIError, BaleClient
+from .config import Settings
+
+LOGGER = logging.getLogger(__name__)
+
+UPLOADING_SUFFIX = ".uploading"
+
+
+@dataclass
+class _StabilityState:
+    size: int
+    mtime_ns: int
+    stable_since: float
+
+
+class FileStabilityTracker:
+    def __init__(self, stable_seconds: float) -> None:
+        self._stable_seconds = stable_seconds
+        self._state: dict[Path, _StabilityState] = {}
+
+    def is_ready(self, path: Path) -> bool:
+        now = time.monotonic()
+        stat = path.stat()
+        current = _StabilityState(
+            size=stat.st_size,
+            mtime_ns=stat.st_mtime_ns,
+            stable_since=now,
+        )
+
+        previous = self._state.get(path)
+        if previous is None:
+            self._state[path] = current
+            return False
+
+        if previous.size != current.size or previous.mtime_ns != current.mtime_ns:
+            self._state[path] = current
+            return False
+
+        elapsed = now - previous.stable_since
+        return elapsed >= self._stable_seconds
+
+    def mark_ready(self, path: Path) -> None:
+        self._state.pop(path, None)
+
+    def prune(self, existing_paths: set[Path]) -> None:
+        for path in tuple(self._state):
+            if path not in existing_paths:
+                self._state.pop(path, None)
+
+
+class SingleInstanceLock:
+    def __init__(self, lock_path: Path) -> None:
+        self._lock_path = lock_path
+        self._handle = None
+
+    def __enter__(self) -> "SingleInstanceLock":
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self._lock_path.open("w", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            handle.close()
+            raise RuntimeError(
+                f"another instance is already running (lock: {self._lock_path})"
+            ) from exc
+
+        handle.write(str(os.getpid()))
+        handle.flush()
+        self._handle = handle
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._handle is None:
+            return
+        try:
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._handle.close()
+            self._handle = None
+
+
+class BackupSenderService:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.client = BaleClient(
+            api_base=settings.bale_api_base,
+            token=settings.bale_bot_token,
+            timeout_seconds=settings.request_timeout_seconds,
+        )
+        self._tracker = FileStabilityTracker(settings.stable_seconds)
+        self._stop = False
+        self._startup_ignored: set[Path] = set()
+
+    def install_signal_handlers(self) -> None:
+        def _handler(signum, _frame) -> None:
+            LOGGER.info("signal=%s received, shutting down", signum)
+            self._stop = True
+
+        signal.signal(signal.SIGTERM, _handler)
+        signal.signal(signal.SIGINT, _handler)
+
+    def run(self) -> None:
+        if not self.settings.backup_dir.exists():
+            raise FileNotFoundError(f"backup directory not found: {self.settings.backup_dir}")
+        if not self.settings.backup_dir.is_dir():
+            raise NotADirectoryError(f"backup directory is not a directory: {self.settings.backup_dir}")
+
+        try:
+            with SingleInstanceLock(self.settings.lock_file):
+                self.install_signal_handlers()
+                self._prepare_startup_ignore()
+                self._recover_uploading_files()
+                if self.settings.clear_webhook_on_start:
+                    self._clear_webhook_best_effort()
+
+                LOGGER.info(
+                    "service started backup_dir=%s patterns=%s recursive_scan=%s",
+                    self.settings.backup_dir,
+                    self.settings.file_patterns,
+                    self.settings.recursive_scan,
+                )
+
+                while not self._stop:
+                    try:
+                        processed_count = self._process_cycle()
+                        if processed_count == 0:
+                            time.sleep(self.settings.scan_interval_seconds)
+                    except Exception:
+                        LOGGER.exception("unexpected error in main loop")
+                        time.sleep(self.settings.retry_backoff_seconds)
+        finally:
+            self.client.close()
+            LOGGER.info("service stopped")
+
+    def _prepare_startup_ignore(self) -> None:
+        if self.settings.startup_send_existing:
+            return
+        self._startup_ignored = set(self._list_candidate_files())
+        LOGGER.info("startup_send_existing=false, ignoring %s existing files", len(self._startup_ignored))
+
+    def _clear_webhook_best_effort(self) -> None:
+        try:
+            cleared = self.client.delete_webhook()
+            LOGGER.info("deleteWebhook called result=%s", cleared)
+        except BaleAPIError:
+            LOGGER.exception("deleteWebhook failed (continuing)")
+
+    def _iter_files_for_pattern(self, pattern: str) -> Iterable[Path]:
+        if self.settings.recursive_scan:
+            yield from self.settings.backup_dir.rglob(pattern)
+            return
+        yield from self.settings.backup_dir.glob(pattern)
+
+    def _list_candidate_files(self) -> list[Path]:
+        files: dict[Path, None] = {}
+        for pattern in self.settings.file_patterns:
+            for path in self._iter_files_for_pattern(pattern):
+                if not path.is_file():
+                    continue
+                if path.name.endswith(UPLOADING_SUFFIX):
+                    continue
+                files[path] = None
+
+        sorted_files = sorted(
+            files.keys(),
+            key=lambda item: (item.stat().st_mtime_ns, item.name),
+        )
+        return sorted_files
+
+    def _recover_uploading_files(self) -> None:
+        now = time.time()
+        max_age_seconds = self.settings.delete_uploading_older_than_hours * 3600
+        for path in self._find_uploading_files():
+            original = Path(str(path)[: -len(UPLOADING_SUFFIX)])
+            if not original.exists():
+                try:
+                    path.rename(original)
+                    LOGGER.warning("recovered pending file %s", original)
+                except OSError:
+                    LOGGER.exception("failed to recover pending file %s", path)
+                continue
+
+            age = now - path.stat().st_mtime
+            if age >= max_age_seconds:
+                try:
+                    path.unlink(missing_ok=True)
+                    LOGGER.warning("deleted stale pending file %s", path)
+                except OSError:
+                    LOGGER.exception("failed to delete stale pending file %s", path)
+
+    def _find_uploading_files(self) -> Iterable[Path]:
+        pattern = f"*{UPLOADING_SUFFIX}"
+        if self.settings.recursive_scan:
+            yield from self.settings.backup_dir.rglob(pattern)
+        else:
+            yield from self.settings.backup_dir.glob(pattern)
+
+    def _process_cycle(self) -> int:
+        self._recover_uploading_files()
+        files = self._list_candidate_files()
+        existing = set(files)
+        self._tracker.prune(existing)
+
+        processed_count = 0
+        for file_path in files:
+            if self._stop:
+                break
+
+            if file_path in self._startup_ignored:
+                continue
+
+            if not self._tracker.is_ready(file_path):
+                continue
+
+            try:
+                sent = self._send_then_delete(file_path)
+            except BaleAPIError:
+                LOGGER.exception("failed to send %s", file_path)
+                time.sleep(self.settings.retry_backoff_seconds)
+                continue
+            except Exception:
+                LOGGER.exception("unexpected failure while processing %s", file_path)
+                time.sleep(self.settings.retry_backoff_seconds)
+                continue
+
+            if sent:
+                processed_count += 1
+
+        return processed_count
+
+    def _send_then_delete(self, path: Path) -> bool:
+        if not path.exists():
+            return False
+
+        file_size = path.stat().st_size
+        if file_size > self.settings.max_file_size_bytes:
+            LOGGER.error(
+                "skipping file bigger than max size file=%s size=%s max=%s",
+                path,
+                file_size,
+                self.settings.max_file_size_bytes,
+            )
+            self._tracker.mark_ready(path)
+            return False
+
+        sending_path = path.with_name(path.name + UPLOADING_SUFFIX)
+        try:
+            path.rename(sending_path)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            LOGGER.exception("failed to claim file for upload: %s", path)
+            return False
+
+        caption = self.settings.caption_template.format(filename=path.name)
+        LOGGER.info("sending file=%s size=%s", path.name, file_size)
+        try:
+            result = self.client.send_document(
+                chat_id=self.settings.bale_target_chat_id,
+                file_path=sending_path,
+                caption=caption,
+                filename=path.name,
+            )
+            message_id = result.get("message_id")
+            LOGGER.info("sent file=%s message_id=%s", path.name, message_id)
+        except BaleAPIError:
+            if not path.exists() and sending_path.exists():
+                try:
+                    sending_path.rename(path)
+                except OSError:
+                    LOGGER.exception("failed to rollback pending file name for %s", sending_path)
+            raise
+
+        try:
+            sending_path.unlink(missing_ok=True)
+        except OSError:
+            LOGGER.exception("file sent but delete failed path=%s", sending_path)
+            return False
+
+        self._tracker.mark_ready(path)
+        self._startup_ignored.discard(path)
+        return True

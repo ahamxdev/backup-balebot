@@ -197,16 +197,10 @@ class BackupSenderService:
                 self._delete_sent_uploading(path=path, sent_marker=sent_marker)
                 continue
 
-            original = Path(str(path)[: -len(UPLOADING_SUFFIX)])
-            if not original.exists():
-                try:
-                    path.rename(original)
-                    LOGGER.warning("recovered pending file %s", original)
-                except OSError:
-                    LOGGER.exception("failed to recover pending file %s", path)
+            try:
+                age = now - path.stat().st_mtime
+            except FileNotFoundError:
                 continue
-
-            age = now - path.stat().st_mtime
             if age >= max_age_seconds:
                 try:
                     path.unlink(missing_ok=True)
@@ -285,13 +279,62 @@ class BackupSenderService:
         else:
             yield from self.settings.backup_dir.glob(pattern)
 
+    def _list_uploading_files(self) -> list[Path]:
+        files = [path for path in self._find_uploading_files() if path.is_file()]
+        return sorted(files, key=lambda item: (item.stat().st_mtime_ns, item.name))
+
+    def _process_uploading_files(self) -> int:
+        processed_count = 0
+        now = time.time()
+        max_age_seconds = self.settings.delete_uploading_older_than_hours * 3600
+
+        for uploading_path in self._list_uploading_files():
+            if self._stop:
+                break
+
+            sent_marker = self._sent_marker_path(uploading_path)
+            if sent_marker.exists():
+                if self._delete_sent_uploading(path=uploading_path, sent_marker=sent_marker):
+                    processed_count += 1
+                continue
+
+            try:
+                age = now - uploading_path.stat().st_mtime
+            except FileNotFoundError:
+                continue
+
+            if age >= max_age_seconds:
+                try:
+                    uploading_path.unlink(missing_ok=True)
+                    self._sent_marker_path(uploading_path).unlink(missing_ok=True)
+                    self._progress_marker_path(uploading_path).unlink(missing_ok=True)
+                    LOGGER.warning("deleted stale pending file %s", uploading_path)
+                except OSError:
+                    LOGGER.exception("failed to delete stale pending file %s", uploading_path)
+                continue
+
+            try:
+                sent = self._send_uploading_then_delete(uploading_path)
+            except BaleAPIError:
+                LOGGER.exception("failed to resume pending upload %s", uploading_path)
+                time.sleep(self.settings.retry_backoff_seconds)
+                continue
+            except Exception:
+                LOGGER.exception("unexpected failure while resuming pending upload %s", uploading_path)
+                time.sleep(self.settings.retry_backoff_seconds)
+                continue
+
+            if sent:
+                processed_count += 1
+
+        return processed_count
+
     def _process_cycle(self) -> int:
-        self._recover_uploading_files()
+        processed_count = self._process_uploading_files()
         files = self._list_candidate_files()
         existing = set(files)
         self._tracker.prune(existing)
 
-        processed_count = 0
         for file_path in files:
             if self._stop:
                 break
@@ -370,6 +413,44 @@ class BackupSenderService:
 
         self._tracker.mark_ready(path)
         self._startup_ignored.discard(path)
+        return True
+
+    def _send_uploading_then_delete(self, uploading_path: Path) -> bool:
+        if not uploading_path.exists():
+            return False
+
+        original_filename = uploading_path.name[: -len(UPLOADING_SUFFIX)]
+        original_path = uploading_path.with_name(original_filename)
+        file_stat = uploading_path.stat()
+        file_size = file_stat.st_size
+        if file_size > self.settings.max_file_size_bytes:
+            LOGGER.error(
+                "skipping pending file bigger than max size file=%s size=%s max=%s",
+                uploading_path,
+                file_size,
+                self.settings.max_file_size_bytes,
+            )
+            return False
+
+        caption = self._build_caption(
+            path=original_path,
+            file_size=file_size,
+            file_mtime=file_stat.st_mtime,
+        )
+
+        LOGGER.info("resuming pending file=%s size=%s", original_filename, file_size)
+        self._send_to_targets(
+            sending_path=uploading_path,
+            original_filename=original_filename,
+            caption=caption,
+        )
+
+        sent_marker = self._mark_sent_pending_delete(uploading_path)
+        if not self._delete_sent_uploading(path=uploading_path, sent_marker=sent_marker):
+            return False
+
+        self._tracker.mark_ready(original_path)
+        self._startup_ignored.discard(original_path)
         return True
 
     def _send_to_targets(self, sending_path: Path, original_filename: str, caption: str) -> None:

@@ -49,10 +49,12 @@ def _parse_float(value: str | None, *, default: float) -> float:
 def _split_csv(value: str | None, *, default: Iterable[str]) -> tuple[str, ...]:
     if value is None:
         return tuple(default)
-    parts = [part.strip() for part in value.split(",") if part.strip()]
+    normalized = value.replace("،", ",").replace(";", ",").replace("\n", ",")
+    parts = [part.strip() for part in normalized.split(",") if part.strip()]
     if not parts:
         return tuple(default)
-    return tuple(parts)
+    # Keep order, drop duplicates.
+    return tuple(dict.fromkeys(parts))
 
 
 @dataclass(frozen=True)
@@ -111,7 +113,7 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
         chat_ids = _split_csv(chat_ids_value, default=())
     else:
         legacy_chat_id = os.getenv("BALE_TARGET_CHAT_ID", "").strip()
-        chat_ids = (legacy_chat_id,) if legacy_chat_id else ()
+        chat_ids = _split_csv(legacy_chat_id, default=())
 
     if not token:
         raise ValueError("BALE_BOT_TOKEN is required")

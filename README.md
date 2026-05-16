@@ -97,6 +97,8 @@ python scripts/get_chat_id.py --env-file .env
 BALE_TARGET_CHAT_IDS=123456789,987654321
 ```
 
+کاما انگلیسی `,` یا فارسی `،` هر دو پشتیبانی می‌شوند.
+
 ## اجرای دستی
 
 ```bash

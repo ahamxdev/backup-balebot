@@ -19,6 +19,8 @@ from .config import Settings
 LOGGER = logging.getLogger(__name__)
 
 UPLOADING_SUFFIX = ".uploading"
+SENT_MARKER_SUFFIX = ".sentok"
+PROGRESS_MARKER_SUFFIX = ".progress"
 
 
 @dataclass
@@ -189,6 +191,12 @@ class BackupSenderService:
         now = time.time()
         max_age_seconds = self.settings.delete_uploading_older_than_hours * 3600
         for path in self._find_uploading_files():
+            sent_marker = self._sent_marker_path(path)
+            if sent_marker.exists():
+                # This file was already sent successfully. Keep retrying deletion only.
+                self._delete_sent_uploading(path=path, sent_marker=sent_marker)
+                continue
+
             original = Path(str(path)[: -len(UPLOADING_SUFFIX)])
             if not original.exists():
                 try:
@@ -202,9 +210,73 @@ class BackupSenderService:
             if age >= max_age_seconds:
                 try:
                     path.unlink(missing_ok=True)
+                    self._sent_marker_path(path).unlink(missing_ok=True)
+                    self._progress_marker_path(path).unlink(missing_ok=True)
                     LOGGER.warning("deleted stale pending file %s", path)
                 except OSError:
                     LOGGER.exception("failed to delete stale pending file %s", path)
+
+    def _sent_marker_path(self, uploading_path: Path) -> Path:
+        return uploading_path.with_name(uploading_path.name + SENT_MARKER_SUFFIX)
+
+    def _mark_sent_pending_delete(self, uploading_path: Path) -> Path:
+        marker = self._sent_marker_path(uploading_path)
+        try:
+            marker.write_text(_format_timestamp(time.time()), encoding="utf-8")
+        except OSError:
+            LOGGER.exception("failed to write sent marker for %s", uploading_path)
+        return marker
+
+    def _delete_sent_uploading(self, path: Path, sent_marker: Path) -> bool:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            LOGGER.exception("file was sent before but delete retry failed path=%s", path)
+            return False
+
+        try:
+            sent_marker.unlink(missing_ok=True)
+        except OSError:
+            LOGGER.warning("delete succeeded but sent marker remove failed marker=%s", sent_marker)
+        try:
+            self._progress_marker_path(path).unlink(missing_ok=True)
+        except OSError:
+            LOGGER.warning("delete succeeded but progress marker remove failed for path=%s", path)
+
+        LOGGER.info("cleaned already-sent file path=%s", path)
+        return True
+
+    def _progress_marker_path(self, uploading_path: Path) -> Path:
+        return uploading_path.with_name(uploading_path.name + PROGRESS_MARKER_SUFFIX)
+
+    def _load_sent_targets(self, uploading_path: Path) -> set[str]:
+        marker = self._progress_marker_path(uploading_path)
+        if not marker.exists():
+            return set()
+        try:
+            raw = marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            LOGGER.exception("failed reading progress marker path=%s", marker)
+            return set()
+
+        if not raw:
+            return set()
+        normalized = raw.replace("،", ",").replace(";", ",").replace("\n", ",")
+        return {part.strip() for part in normalized.split(",") if part.strip()}
+
+    def _save_sent_targets(self, uploading_path: Path, sent_targets: set[str]) -> None:
+        marker = self._progress_marker_path(uploading_path)
+        if not sent_targets:
+            try:
+                marker.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.warning("failed deleting empty progress marker path=%s", marker)
+            return
+
+        try:
+            marker.write_text(",".join(sorted(sent_targets)), encoding="utf-8")
+        except OSError:
+            LOGGER.exception("failed writing progress marker path=%s", marker)
 
     def _find_uploading_files(self) -> Iterable[Path]:
         pattern = f"*{UPLOADING_SUFFIX}"
@@ -285,12 +357,15 @@ class BackupSenderService:
                     sending_path.rename(path)
                 except OSError:
                     LOGGER.exception("failed to rollback pending file name for %s", sending_path)
+            sent_marker = self._sent_marker_path(sending_path)
+            try:
+                sent_marker.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.warning("failed to remove sent marker after rollback marker=%s", sent_marker)
             raise
 
-        try:
-            sending_path.unlink(missing_ok=True)
-        except OSError:
-            LOGGER.exception("file sent but delete failed path=%s", sending_path)
+        sent_marker = self._mark_sent_pending_delete(sending_path)
+        if not self._delete_sent_uploading(path=sending_path, sent_marker=sent_marker):
             return False
 
         self._tracker.mark_ready(path)
@@ -298,7 +373,11 @@ class BackupSenderService:
         return True
 
     def _send_to_targets(self, sending_path: Path, original_filename: str, caption: str) -> None:
+        sent_targets = self._load_sent_targets(sending_path)
         for chat_id in self.settings.bale_target_chat_ids:
+            if chat_id in sent_targets:
+                LOGGER.info("skip already-sent target file=%s chat_id=%s", original_filename, chat_id)
+                continue
             try:
                 result = self.client.send_document(
                     chat_id=chat_id,
@@ -307,11 +386,16 @@ class BackupSenderService:
                     filename=original_filename,
                 )
             except BaleAPIError as exc:
+                self._save_sent_targets(sending_path, sent_targets)
                 raise BaleAPIError(
                     f"failed sending file={original_filename} to chat_id={chat_id}: {exc}"
                 ) from exc
             message_id = result.get("message_id")
             LOGGER.info("sent file=%s chat_id=%s message_id=%s", original_filename, chat_id, message_id)
+            sent_targets.add(chat_id)
+            self._save_sent_targets(sending_path, sent_targets)
+
+        self._save_sent_targets(sending_path, set())
 
     def _build_caption(self, path: Path, file_size: int, file_mtime: float) -> str:
         return self.settings.caption_template.format(

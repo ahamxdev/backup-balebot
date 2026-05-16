@@ -131,10 +131,11 @@ class BackupSenderService:
                     self._clear_webhook_best_effort()
 
                 LOGGER.info(
-                    "service started backup_dir=%s patterns=%s recursive_scan=%s",
+                    "service started backup_dir=%s patterns=%s recursive_scan=%s target_chat_ids=%s",
                     self.settings.backup_dir,
                     self.settings.file_patterns,
                     self.settings.recursive_scan,
+                    self.settings.bale_target_chat_ids,
                 )
 
                 while not self._stop:
@@ -277,14 +278,7 @@ class BackupSenderService:
 
         LOGGER.info("sending file=%s size=%s", path.name, file_size)
         try:
-            result = self.client.send_document(
-                chat_id=self.settings.bale_target_chat_id,
-                file_path=sending_path,
-                caption=caption,
-                filename=path.name,
-            )
-            message_id = result.get("message_id")
-            LOGGER.info("sent file=%s message_id=%s", path.name, message_id)
+            self._send_to_targets(sending_path=sending_path, original_filename=path.name, caption=caption)
         except BaleAPIError:
             if not path.exists() and sending_path.exists():
                 try:
@@ -302,6 +296,22 @@ class BackupSenderService:
         self._tracker.mark_ready(path)
         self._startup_ignored.discard(path)
         return True
+
+    def _send_to_targets(self, sending_path: Path, original_filename: str, caption: str) -> None:
+        for chat_id in self.settings.bale_target_chat_ids:
+            try:
+                result = self.client.send_document(
+                    chat_id=chat_id,
+                    file_path=sending_path,
+                    caption=caption,
+                    filename=original_filename,
+                )
+            except BaleAPIError as exc:
+                raise BaleAPIError(
+                    f"failed sending file={original_filename} to chat_id={chat_id}: {exc}"
+                ) from exc
+            message_id = result.get("message_id")
+            LOGGER.info("sent file=%s chat_id=%s message_id=%s", original_filename, chat_id, message_id)
 
     def _build_caption(self, path: Path, file_size: int, file_mtime: float) -> str:
         return self.settings.caption_template.format(

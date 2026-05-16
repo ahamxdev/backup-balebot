@@ -59,7 +59,7 @@ def _split_csv(value: str | None, *, default: Iterable[str]) -> tuple[str, ...]:
 class Settings:
     bale_bot_token: str
     bale_api_base: str
-    bale_target_chat_id: str
+    bale_target_chat_ids: tuple[str, ...]
     backup_dir: Path
     file_patterns: tuple[str, ...]
     recursive_scan: bool
@@ -106,19 +106,24 @@ def load_settings(dotenv_path: str = ".env") -> Settings:
     load_dotenv(Path(dotenv_path))
 
     token = os.getenv("BALE_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("BALE_TARGET_CHAT_ID", "").strip()
+    chat_ids_value = os.getenv("BALE_TARGET_CHAT_IDS")
+    if chat_ids_value:
+        chat_ids = _split_csv(chat_ids_value, default=())
+    else:
+        legacy_chat_id = os.getenv("BALE_TARGET_CHAT_ID", "").strip()
+        chat_ids = (legacy_chat_id,) if legacy_chat_id else ()
 
     if not token:
         raise ValueError("BALE_BOT_TOKEN is required")
-    if not chat_id:
-        raise ValueError("BALE_TARGET_CHAT_ID is required")
+    if not chat_ids:
+        raise ValueError("BALE_TARGET_CHAT_IDS or BALE_TARGET_CHAT_ID is required")
 
     backup_dir = Path(os.getenv("BACKUP_DIR", "/backup")).expanduser().resolve()
 
     return Settings(
         bale_bot_token=token,
         bale_api_base=os.getenv("BALE_API_BASE", "https://tapi.bale.ai").rstrip("/"),
-        bale_target_chat_id=chat_id,
+        bale_target_chat_ids=chat_ids,
         backup_dir=backup_dir,
         file_patterns=_split_csv(
             os.getenv("BACKUP_FILE_PATTERNS"),

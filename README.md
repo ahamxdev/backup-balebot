@@ -37,8 +37,16 @@ pip install -e .
 فایل `.env` ساخته شده و توکن شما داخل آن قرار گرفته است. فقط این مقدار را تکمیل کنید:
 
 ```env
-BALE_TARGET_CHAT_ID=
+BALE_TARGET_CHAT_IDS=123456789,987654321
 ```
+
+اگر فقط یک نفر مقصد است، می‌توانی یک مقدار بدهی:
+
+```env
+BALE_TARGET_CHAT_IDS=123456789
+```
+
+سازگاری با نسخه قبلی هم حفظ شده و اگر `BALE_TARGET_CHAT_IDS` خالی باشد، مقدار `BALE_TARGET_CHAT_ID` استفاده می‌شود.
 
 بقیه تنظیمات مهم:
 
@@ -83,7 +91,11 @@ Sent at: 2026-05-16 02:30:35 +0330
 python scripts/get_chat_id.py --env-file .env
 ```
 
-3. مقدار نشان‌داده‌شده را در `BALE_TARGET_CHAT_ID` قرار دهید.
+3. برای یک مقصد در `BALE_TARGET_CHAT_IDS` قرار دهید. برای چند مقصد با کاما جدا کنید:
+
+```env
+BALE_TARGET_CHAT_IDS=123456789,987654321
+```
 
 ## اجرای دستی
 

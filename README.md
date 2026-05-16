@@ -1,28 +1,42 @@
-# Bale Backup Bot (Production-ready)
+# Bale Backup Bot (Production Ready)
 
-این سرویس یک Worker دائمی برای بله است که:
+This service continuously watches a backup directory, uploads new backup files to Bale chat(s), and removes files after successful delivery.
 
-- مسیر بکاپ (`/backup`) را مانیتور می‌کند.
-- فقط فایل‌هایی که **ثابت** شده‌اند (در حال نوشته‌شدن نیستند) را ارسال می‌کند.
-- فایل را به پیوی شما در بله ارسال می‌کند (`sendDocument`).
-- بعد از ارسال موفق، همان فایل را حذف می‌کند.
-- اگر سرویس ری‌استارت شود، فایل‌های نیمه‌کاره (`.uploading`) را Recover می‌کند.
-- با Lock File از اجرای هم‌زمان چند نمونه جلوگیری می‌کند.
+## Features
 
-## معماری امن برای Production
+- Watches `BACKUP_DIR` on a scan interval.
+- Waits for files to become stable before upload (prevents partial uploads).
+- Supports one or multiple recipients with `BALE_TARGET_CHAT_IDS`.
+- Uses atomic rename (`.uploading`) to avoid race conditions.
+- Retries safely on failures.
+- Prevents duplicate sends in partial-failure scenarios.
+- Deletes files only after successful send flow.
+- Uses a lock file to prevent multiple service instances.
 
-سناریویی که پیاده شده:
+## Processing Flow
 
-1. اسکن دوره‌ای دایرکتوری (پایدارتر از event-only در محیط‌های مختلف سرور)
-2. بررسی پایداری فایل (Size/Mtime باید برای `STABLE_SECONDS` ثابت بماند)
-3. Claim اتمیک فایل با `rename -> *.uploading`
-4. ارسال با API بله
-5. حذف فایل بعد از موفقیت
-6. در خطا، فایل به نام اصلی برگردانده می‌شود تا retry شود
+1. Scan `BACKUP_DIR` for matching patterns.
+2. Ignore files that are still changing.
+3. Rename file to `*.uploading` (claim step).
+4. Send to all configured `chat_id` targets.
+5. Mark sent state and delete uploaded file.
+6. On restart, recover pending `.uploading` files safely.
 
-این مدل در عمل برای بکاپ‌های دیتابیس قابل اعتمادتر از watcher-only است.
+## Project Structure
 
-## نصب
+- `src/balebot_backup/`: main service and API client
+- `scripts/get_chat_id.py`: helper to extract `chat_id` from `getUpdates`
+- `systemd/bale-backup-bot.service`: production service template
+- `.env.example`: configuration template
+
+## Requirements
+
+- Python `3.10+`
+- A Bale bot token
+- At least one valid target `chat_id`
+- Read and write permissions for `BACKUP_DIR`
+
+## Installation
 
 ```bash
 cd /home/ahamxdev/Files/Workspace/personal/backup-balebot
@@ -32,32 +46,36 @@ pip install -U pip
 pip install -e .
 ```
 
-## تنظیم `.env`
+## Configuration
 
-فایل `.env` ساخته شده و توکن شما داخل آن قرار گرفته است. فقط این مقدار را تکمیل کنید:
+Copy `.env.example` to `.env` and set values.
+
+### Required
 
 ```env
+BALE_BOT_TOKEN=YOUR_BALE_BOT_TOKEN
 BALE_TARGET_CHAT_IDS=123456789,987654321
 ```
 
-اگر فقط یک نفر مقصد است، می‌توانی یک مقدار بدهی:
+Notes:
+- `BALE_TARGET_CHAT_IDS` accepts comma-separated values.
+- English comma `,` and Persian comma `،` are both supported.
+- Legacy fallback still works: `BALE_TARGET_CHAT_ID` (single or comma-separated) is used only when `BALE_TARGET_CHAT_IDS` is empty.
 
-```env
-BALE_TARGET_CHAT_IDS=123456789
-```
-
-سازگاری با نسخه قبلی هم حفظ شده و اگر `BALE_TARGET_CHAT_IDS` خالی باشد، مقدار `BALE_TARGET_CHAT_ID` استفاده می‌شود.
-
-بقیه تنظیمات مهم:
+### Main Optional Settings
 
 - `BACKUP_DIR=/backup`
 - `BACKUP_FILE_PATTERNS=*.bak,*.backup,*.dump,*.gz,*.sql,*.sql.gz,*.tar,*.tar.gz,*.xz,*.zip,*.zst`
-- `STABLE_SECONDS=20`
 - `SCAN_INTERVAL_SECONDS=5`
-- `SERVER_PUBLIC_IP=` اگر خالی باشد، سرویس خودش IP پابلیک را lookup می‌کند.
-- `PUBLIC_IP_LOOKUP_URL=https://api.ipify.org`
+- `STABLE_SECONDS=20`
+- `MAX_FILE_SIZE_MB=50`
+- `STARTUP_SEND_EXISTING=true`
+- `CLEAR_WEBHOOK_ON_START=true`
+- `LOG_LEVEL=INFO`
 
-کپشن پیش‌فرض هر فایل کوتاه ولی کاربردی است:
+### Caption Template
+
+Default upload caption:
 
 ```text
 Backup uploaded
@@ -69,7 +87,9 @@ Backup mtime: 2026-05-16 02:30:12 +0330
 Sent at: 2026-05-16 02:30:35 +0330
 ```
 
-اگر خواستی متن کپشن را عوض کنی، `CAPTION_TEMPLATE` را در `.env` تغییر بده. placeholderهای قابل استفاده:
+Set custom format with `CAPTION_TEMPLATE`.
+
+Available placeholders:
 
 ```text
 {filename}
@@ -82,37 +102,37 @@ Sent at: 2026-05-16 02:30:35 +0330
 {sent_at}
 ```
 
-## گرفتن `chat_id`
+## How To Get `chat_id`
 
-1. در بله به بات یک پیام بفرستید.
-2. دستور زیر را اجرا کنید:
+1. Send any message to your bot in Bale.
+2. Run:
 
 ```bash
 python scripts/get_chat_id.py --env-file .env
 ```
 
-3. برای یک مقصد در `BALE_TARGET_CHAT_IDS` قرار دهید. برای چند مقصد با کاما جدا کنید:
+3. Put returned ids in `BALE_TARGET_CHAT_IDS`.
+
+Example:
 
 ```env
 BALE_TARGET_CHAT_IDS=123456789,987654321
 ```
 
-کاما انگلیسی `,` یا فارسی `،` هر دو پشتیبانی می‌شوند.
-
-## اجرای دستی
+## Run Locally
 
 ```bash
 source .venv/bin/activate
 bale-backup-bot --env-file .env
 ```
 
-## اجرای دائمی با systemd
+## Run With systemd
 
-فایل نمونه: `systemd/bale-backup-bot.service`
+Use `systemd/bale-backup-bot.service` as a template.
 
-1. مسیرها و کاربر را متناسب با سرور خودتان اصلاح کنید.
-2. فایل را در `/etc/systemd/system/` کپی کنید.
-3. سپس:
+1. Update paths and user/group for your server.
+2. Copy to `/etc/systemd/system/bale-backup-bot.service`.
+3. Enable and start:
 
 ```bash
 sudo systemctl daemon-reload
@@ -121,13 +141,27 @@ sudo systemctl status bale-backup-bot.service
 journalctl -u bale-backup-bot.service -f
 ```
 
-## نکات مهم
+## Reliability Notes
 
-- محدودیت ارسال فایل طبق مستند بله در حال حاضر 50MB است (`MAX_FILE_SIZE_MB=50`).
-- اگر فایل از حد بیشتر باشد، ارسال نمی‌شود و در لاگ خطا ثبت می‌شود.
-- برای polling، روی بات webhook فعال نباشد. سرویس هنگام استارت `deleteWebhook` را صدا می‌زند.
+- If one target fails and others succeed, the service tracks per-target send progress and retries only remaining targets.
+- If file deletion fails after a successful send, the service retries deletion without resending the same file.
+- On startup, `.uploading` pending files are recovered and handled safely.
 
-## مستند مرجع بله
+## Troubleshooting
+
+- `404 Bad Request: no such group or user`
+  - The `chat_id` is invalid, or that user/group has not started the bot yet.
+  - Send a message to the bot from each target account and refresh `chat_id`.
+
+- Files are repeatedly retried
+  - Check write permissions on `BACKUP_DIR`.
+  - Ensure the service user can delete files from backup path.
+
+- Bot sends nothing
+  - Verify `BALE_BOT_TOKEN`, `BALE_TARGET_CHAT_IDS`, and file patterns.
+  - Check logs with `journalctl -u bale-backup-bot.service -f`.
+
+## Bale API Reference
 
 - https://docs.bale.ai/
-- Endpoint pattern: `https://tapi.bale.ai/bot<token>/METHOD_NAME`
+- Endpoint format: `https://tapi.bale.ai/bot<TOKEN>/<METHOD>`
